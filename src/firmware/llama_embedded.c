@@ -1,0 +1,945 @@
+/*
+ * Llama-2 Inference for VexRiscv on Analogue Pocket
+ *
+ * This is an embedded adaptation of llama2.c (karpathy/llama2.c)
+ * Modified to work with:
+ *   - Data slot loading instead of file I/O
+ *   - SDRAM for model weights and heap
+ *   - Terminal output instead of stdout
+ *
+ * Original: https://github.com/karpathy/llama2.c
+ */
+
+#include "libc/libc.h"
+#include "dataslot.h"
+#include "terminal.h"
+#include "tokenizer_data.h"  /* Embedded tokenizer workaround */
+
+/* Redirect printf to terminal */
+#define printf term_printf
+
+/* SDRAM arena for large allocations (RunState) - simple bump allocator */
+#define SDRAM_ARENA_ADDR      0x12100000                  /* After tokenizer data */
+#define SDRAM_ARENA_END       0x14000000                  /* End of 64MB SDRAM */
+static uint8_t* sdram_arena_ptr = (uint8_t*)SDRAM_ARENA_ADDR;
+
+/* Simple bump allocator for SDRAM - no free, just allocate sequentially */
+static void* sdram_alloc(size_t size) {
+    /* Align to 8 bytes */
+    size = (size + 7) & ~7;
+    if (sdram_arena_ptr + size > (uint8_t*)SDRAM_ARENA_END) {
+        return NULL;
+    }
+    void* ptr = sdram_arena_ptr;
+    sdram_arena_ptr += size;
+    return ptr;
+}
+
+/* Configuration - adjust these for your model */
+#define DEFAULT_STEPS       64      /* Max tokens to generate */
+#define DEFAULT_TEMPERATURE 1.0f    /* Sampling temperature */
+#define DEFAULT_TOPP        0.9f
+#define DEFAULT_PROMPT      "Once upon a time"
+
+/* ============================================
+ * Transformer model structures
+ * ============================================ */
+
+typedef struct {
+    int dim;         /* Transformer dimension */
+    int hidden_dim;  /* FFN hidden dimension */
+    int n_layers;    /* Number of layers */
+    int n_heads;     /* Number of attention heads */
+    int n_kv_heads;  /* Number of KV heads (can be < n_heads for MQA) */
+    int vocab_size;  /* Vocabulary size */
+    int seq_len;     /* Max sequence length */
+} Config;
+
+typedef struct {
+    float* token_embedding_table;
+    float* rms_att_weight;
+    float* rms_ffn_weight;
+    float* wq;
+    float* wk;
+    float* wv;
+    float* wo;
+    float* w1;
+    float* w2;
+    float* w3;
+    float* rms_final_weight;
+    float* wcls;
+} TransformerWeights;
+
+typedef struct {
+    float *x;
+    float *xb;
+    float *xb2;
+    float *hb;
+    float *hb2;
+    float *q;
+    float *k;
+    float *v;
+    float *att;
+    float *logits;
+    float* key_cache;
+    float* value_cache;
+} RunState;
+
+typedef struct {
+    Config config;
+    TransformerWeights weights;
+    RunState state;
+    float* data;
+    size_t file_size;
+} Transformer;
+
+/* ============================================
+ * Tokenizer structures
+ * ============================================ */
+
+typedef struct {
+    char *str;
+    int id;
+} TokenIndex;
+
+typedef struct {
+    char** vocab;
+    float* vocab_scores;
+    TokenIndex *sorted_vocab;
+    int vocab_size;
+    unsigned int max_token_length;
+    unsigned char byte_pieces[512];
+} Tokenizer;
+
+/* Global pointer for str_lookup to access vocab without qsort */
+Tokenizer* g_tokenizer = NULL;
+
+/* ============================================
+ * Sampler structures
+ * ============================================ */
+
+typedef struct {
+    float prob;
+    int index;
+} ProbIndex;
+
+typedef struct {
+    int vocab_size;
+    ProbIndex* probindex;
+    float temperature;
+    float topp;
+    unsigned long long rng_state;
+} Sampler;
+
+/* ============================================
+ * Memory allocation for run state
+ * ============================================ */
+
+static void malloc_run_state(RunState* s, Config* p) {
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int kv_cache_size = p->n_layers * p->seq_len * kv_dim * sizeof(float);
+
+    s->x = sdram_alloc(p->dim * sizeof(float));
+    s->xb = sdram_alloc(p->dim * sizeof(float));
+    s->xb2 = sdram_alloc(p->dim * sizeof(float));
+    s->hb = sdram_alloc(p->hidden_dim * sizeof(float));
+    s->hb2 = sdram_alloc(p->hidden_dim * sizeof(float));
+    s->q = sdram_alloc(p->dim * sizeof(float));
+    s->key_cache = sdram_alloc(kv_cache_size);
+    s->value_cache = sdram_alloc(kv_cache_size);
+    s->att = sdram_alloc(p->n_heads * p->seq_len * sizeof(float));
+    s->logits = sdram_alloc(p->vocab_size * sizeof(float));
+
+    if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
+     || !s->key_cache || !s->value_cache || !s->att || !s->logits) {
+        printf("ERROR: sdram_alloc failed!\n");
+        while(1);
+    }
+}
+
+static void free_run_state(RunState* s) {
+    (void)s;  /* SDRAM bump allocator doesn't free */
+}
+
+/* ============================================
+ * Weight memory mapping
+ * ============================================ */
+
+static void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
+    int head_size = p->dim / p->n_heads;
+    unsigned long long n_layers = p->n_layers;
+
+    w->token_embedding_table = ptr;
+    ptr += p->vocab_size * p->dim;
+    w->rms_att_weight = ptr;
+    ptr += n_layers * p->dim;
+    w->wq = ptr;
+    ptr += n_layers * p->dim * (p->n_heads * head_size);
+    w->wk = ptr;
+    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+    w->wv = ptr;
+    ptr += n_layers * p->dim * (p->n_kv_heads * head_size);
+    w->wo = ptr;
+    ptr += n_layers * (p->n_heads * head_size) * p->dim;
+    w->rms_ffn_weight = ptr;
+    ptr += n_layers * p->dim;
+    w->w1 = ptr;
+    ptr += n_layers * p->dim * p->hidden_dim;
+    w->w2 = ptr;
+    ptr += n_layers * p->hidden_dim * p->dim;
+    w->w3 = ptr;
+    ptr += n_layers * p->dim * p->hidden_dim;
+    w->rms_final_weight = ptr;
+    ptr += p->dim;
+    ptr += p->seq_len * head_size / 2; /* skip freq_cis_real */
+    ptr += p->seq_len * head_size / 2; /* skip freq_cis_imag */
+    w->wcls = shared_weights ? w->token_embedding_table : ptr;
+}
+
+/* ============================================
+ * Build transformer from SDRAM data
+ * ============================================ */
+
+static void build_transformer_from_memory(Transformer *t, void* data, size_t size) {
+    Config* config = (Config*)data;
+    t->config = *config;
+
+    int shared_weights = config->vocab_size > 0 ? 1 : 0;
+    t->config.vocab_size = abs(config->vocab_size);
+
+    float* weights_ptr = (float*)((char*)data + sizeof(Config));
+    memory_map_weights(&t->weights, &t->config, weights_ptr, shared_weights);
+    malloc_run_state(&t->state, &t->config);
+
+    t->data = data;
+    t->file_size = size;
+}
+
+static void free_transformer(Transformer* t) {
+    free_run_state(&t->state);
+    /* Don't free t->data - it's in SDRAM and managed elsewhere */
+}
+
+/* ============================================
+ * Neural network operations
+ * ============================================ */
+
+static void rmsnorm(float* o, float* x, float* weight, int size) {
+    float ss = 0.0f;
+    for (int j = 0; j < size; j++) {
+        ss += x[j] * x[j];
+    }
+    ss /= size;
+    ss += 1e-5f;
+    ss = 1.0f / sqrtf(ss);
+    for (int j = 0; j < size; j++) {
+        o[j] = weight[j] * (ss * x[j]);
+    }
+}
+
+static void softmax(float* x, int size) {
+    float max_val = x[0];
+    for (int i = 1; i < size; i++) {
+        if (x[i] > max_val) {
+            max_val = x[i];
+        }
+    }
+    float sum = 0.0f;
+    for (int i = 0; i < size; i++) {
+        x[i] = expf(x[i] - max_val);
+        sum += x[i];
+    }
+    for (int i = 0; i < size; i++) {
+        x[i] /= sum;
+    }
+}
+
+static void matmul(float* xout, float* x, float* w, int n, int d) {
+    for (int i = 0; i < d; i++) {
+        float val = 0.0f;
+        for (int j = 0; j < n; j++) {
+            val += w[i * n + j] * x[j];
+        }
+        xout[i] = val;
+    }
+}
+
+static float* forward(Transformer* transformer, int token, int pos) {
+    Config* p = &transformer->config;
+    TransformerWeights* w = &transformer->weights;
+    RunState* s = &transformer->state;
+    float *x = s->x;
+    int dim = p->dim;
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int kv_mul = p->n_heads / p->n_kv_heads;
+    int hidden_dim = p->hidden_dim;
+    int head_size = dim / p->n_heads;
+
+    float* content_row = w->token_embedding_table + token * dim;
+    memcpy(x, content_row, dim * sizeof(*x));
+
+    for (unsigned long long l = 0; l < (unsigned long long)p->n_layers; l++) {
+        rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+
+
+        int loff = l * p->seq_len * kv_dim;
+        s->k = s->key_cache + loff + pos * kv_dim;
+        s->v = s->value_cache + loff + pos * kv_dim;
+
+        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
+        matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+        matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+
+        for (int i = 0; i < dim; i += 2) {
+            int head_dim = i % head_size;
+            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+            float val = pos * freq;
+            float fcr = cosf(val);
+            float fci = sinf(val);
+            int rotn = i < kv_dim ? 2 : 1;
+            for (int v = 0; v < rotn; v++) {
+                float* vec = v == 0 ? s->q : s->k;
+                float v0 = vec[i];
+                float v1 = vec[i+1];
+                vec[i]   = v0 * fcr - v1 * fci;
+                vec[i+1] = v0 * fci + v1 * fcr;
+            }
+        }
+
+        for (int h = 0; h < p->n_heads; h++) {
+            float* q = s->q + h * head_size;
+            float* att = s->att + h * p->seq_len;
+            for (int t = 0; t <= pos; t++) {
+                float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+                float score = 0.0f;
+                for (int i = 0; i < head_size; i++) {
+                    score += q[i] * k[i];
+                }
+                score /= sqrtf(head_size);
+                att[t] = score;
+            }
+
+            softmax(att, pos + 1);
+
+            float* xb = s->xb + h * head_size;
+            memset(xb, 0, head_size * sizeof(float));
+            for (int t = 0; t <= pos; t++) {
+                float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+                float a = att[t];
+                for (int i = 0; i < head_size; i++) {
+                    xb[i] += a * v[i];
+                }
+            }
+        }
+
+        matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb2[i];
+        }
+
+        rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+
+        matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+
+        for (int i = 0; i < hidden_dim; i++) {
+            float val = s->hb[i];
+            val *= (1.0f / (1.0f + expf(-val)));
+            val *= s->hb2[i];
+            s->hb[i] = val;
+        }
+
+        matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
+
+        for (int i = 0; i < dim; i++) {
+            x[i] += s->xb[i];
+        }
+    }
+
+    rmsnorm(x, x, w->rms_final_weight, dim);
+    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    return s->logits;
+}
+
+/* ============================================
+ * Tokenizer
+ * ============================================ */
+
+static int compare_tokens(const void *a, const void *b) {
+    return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
+}
+
+/* Read 32-bit value from potentially unaligned address using only word-aligned reads */
+static inline uint32_t read_u32(const uint8_t* ptr) {
+    uintptr_t addr = (uintptr_t)ptr;
+    uintptr_t aligned_addr = addr & ~3;
+    int offset = addr & 3;
+
+    /* Read the aligned word(s) */
+    uint32_t w0 = *(const volatile uint32_t*)aligned_addr;
+
+    if (offset == 0) {
+        return w0;
+    }
+
+    /* Need to read next word and combine */
+    uint32_t w1 = *(const volatile uint32_t*)(aligned_addr + 4);
+
+    /* Extract bytes from the two words based on offset */
+    return (w0 >> (offset * 8)) | (w1 << ((4 - offset) * 8));
+}
+
+/* Helper to read potentially unaligned float */
+static inline float read_float(const uint8_t* ptr) {
+    uint32_t bits = read_u32(ptr);
+    float result;
+    memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+/* Tokenizer buffers:
+ * - Pointers and scores allocated from PSRAM heap (word-aligned access)
+ * - String pool in BRAM (PSRAM doesn't support byte writes!)
+ */
+static char** tok_vocab_ptrs = NULL;
+static float* tok_scores_ptr = NULL;
+
+/* String pool - allocated from PSRAM heap for 32K tokenizer (~500KB) */
+#define TOK_STRING_POOL_SIZE (512 * 1024)  /* 512KB for token strings */
+static char* tok_string_pool = NULL;
+static char* tok_string_ptr = NULL;
+
+/* BRAM buffer for encode() - SDRAM byte writes don't work! */
+#define ENCODE_BUFFER_SIZE 256       /* For BPE string operations */
+static char encode_str_buffer[ENCODE_BUFFER_SIZE];
+
+static void build_tokenizer_from_memory(Tokenizer* t, void* data, int vocab_size) {
+    t->vocab_size = vocab_size;
+    t->sorted_vocab = NULL;
+
+    /* Allocate vocab pointers, scores, and string pool from PSRAM heap */
+    tok_vocab_ptrs = (char**)malloc(vocab_size * sizeof(char*));
+    tok_scores_ptr = (float*)malloc(vocab_size * sizeof(float));
+    tok_string_pool = (char*)malloc(TOK_STRING_POOL_SIZE);
+
+    if (!tok_vocab_ptrs || !tok_scores_ptr || !tok_string_pool) {
+        printf("ERROR: Failed to allocate tokenizer buffers\n");
+        return;
+    }
+
+    /* Reset string pool pointer */
+    tok_string_ptr = tok_string_pool;
+
+    t->vocab = tok_vocab_ptrs;
+    t->vocab_scores = tok_scores_ptr;
+
+    for (int i = 0; i < 256; i++) {
+        t->byte_pieces[i * 2] = (unsigned char)i;
+        t->byte_pieces[i * 2 + 1] = '\0';
+    }
+
+    /* Read directly from SDRAM using byte access */
+    uint8_t* ptr = (uint8_t*)data;
+
+    printf("  Tok at 0x%08X\n", (uint32_t)data);
+
+    /* Read max_token_length */
+    uint32_t raw_max_tok = read_u32(ptr);
+    printf("  raw max_token_length=%d (0x%08X)\n", raw_max_tok, raw_max_tok);
+
+    /* WORKAROUND: The first word of tokenizer data gets corrupted by CDC bug.
+     * Known corruption: 0x07 -> 0x1B (bits 3,4 set incorrectly)
+     * If we detect this pattern, use the correct value. */
+    if (raw_max_tok == 0x1B) {
+        t->max_token_length = 7;  /* Correct value for tokenizer.bin */
+        printf("  WORKAROUND: Corrected to %d\n", t->max_token_length);
+    } else {
+        t->max_token_length = raw_max_tok;
+    }
+    printf("  max_token_length=%d\n", t->max_token_length);
+    ptr += 4;
+
+    /* Parse tokens - copy from embedded BRAM data to BRAM string pool */
+    int error_count = 0;
+    for (int i = 0; i < vocab_size; i++) {
+
+        /* Read length to check for corruption */
+        int32_t len = (int32_t)read_u32(ptr + 4);
+
+
+        /* Detect obvious corruption: len should never be huge or negative */
+        if (len < 0 || len > 20) {
+            if (error_count < 5) {
+                printf("\n  ERR tok[%d] @0x%X: suspicious len=%d\n", i, (uint32_t)ptr, len);
+            }
+            error_count++;
+        }
+
+        /* Read score (4 bytes) */
+        t->vocab_scores[i] = read_float(ptr);
+        ptr += 4;
+
+        /* Skip length (already read above) */
+        ptr += 4;
+
+        if (len < 0 || len > 100) {
+            printf("\nERROR: bad len %d at tok %d\n", len, i);
+            return;
+        }
+
+        /* Allocate string from BRAM pool */
+        if (tok_string_ptr + len + 1 > tok_string_pool + TOK_STRING_POOL_SIZE) {
+            printf("\nERROR: String pool exhausted at tok %d\n", i);
+            return;
+        }
+        char* str = tok_string_ptr;
+        /* Align string pool pointer to next word boundary for proper writes */
+        tok_string_ptr += (len + 1 + 3) & ~3;
+
+        /* Copy string using word-aligned writes to PSRAM */
+        /* First, read all bytes into a temp buffer, then write as words */
+        uint32_t word_buf = 0;
+        int word_idx = 0;
+        volatile uint32_t* dst_word = (volatile uint32_t*)str;
+
+        for (int j = 0; j < len; j++) {
+            /* Read byte from SDRAM using word-aligned read */
+            uintptr_t byte_addr = (uintptr_t)(ptr + j);
+            uintptr_t word_addr = byte_addr & ~3;
+            int byte_offset = byte_addr & 3;
+            uint32_t src_word = *(const volatile uint32_t*)word_addr;
+            uint8_t byte_val = (src_word >> (byte_offset * 8)) & 0xFF;
+
+            /* Pack into word buffer */
+            word_buf |= ((uint32_t)byte_val) << (word_idx * 8);
+            word_idx++;
+
+            if (word_idx == 4) {
+                *dst_word++ = word_buf;
+                word_buf = 0;
+                word_idx = 0;
+            }
+        }
+        /* Add null terminator and write final word */
+        if (word_idx < 4) {
+            /* Null terminator goes in current word */
+            *dst_word = word_buf;  /* Remaining bytes are already 0 */
+        } else {
+            /* Need new word for null terminator */
+            *dst_word = 0;
+        }
+        t->vocab[i] = str;
+
+        ptr += len;
+    }
+    printf("Tokenizer: %d tokens loaded\n", vocab_size);
+}
+
+static void free_tokenizer(Tokenizer* t) {
+    (void)t;  /* SDRAM bump allocator doesn't free */
+}
+
+/* Parse <0xXX> format manually (sscanf doesn't support %hhX) */
+static int parse_byte_token(const char *s, unsigned char *out) {
+    /* Check length first: need exactly "<0xXX>" = 6 chars */
+    if (s[0] != '<') return 0;
+    if (s[1] != '0') return 0;
+    if (s[2] != 'x') return 0;
+    /* s[3] and s[4] are hex digits, s[5] must be '>' */
+    if (s[3] == '\0' || s[4] == '\0' || s[5] != '>') return 0;
+
+    int hi = 0, lo = 0;
+    char c = s[3];
+    if (c >= '0' && c <= '9') hi = c - '0';
+    else if (c >= 'A' && c <= 'F') hi = c - 'A' + 10;
+    else if (c >= 'a' && c <= 'f') hi = c - 'a' + 10;
+    else return 0;
+
+    c = s[4];
+    if (c >= '0' && c <= '9') lo = c - '0';
+    else if (c >= 'A' && c <= 'F') lo = c - 'A' + 10;
+    else if (c >= 'a' && c <= 'f') lo = c - 'a' + 10;
+    else return 0;
+
+    *out = (unsigned char)((hi << 4) | lo);
+    return 1;
+}
+
+static char* decode(Tokenizer* t, int prev_token, int token) {
+    /* Bounds check */
+    if (token < 0 || token >= t->vocab_size) {
+        return "(BAD)";
+    }
+    char *piece = t->vocab[token];
+    if (piece == NULL) {
+        return "(NULL)";
+    }
+    if (prev_token == 1 && piece[0] == ' ') { piece++; }
+
+    /* Handle <0xXX> format byte tokens */
+    unsigned char byte_val;
+    if (parse_byte_token(piece, &byte_val)) {
+        piece = (char*)t->byte_pieces + byte_val * 2;
+    }
+    return piece;
+}
+
+static void safe_printf(char *piece) {
+    if (piece == NULL) { return; }
+    if (piece[0] == '\0') { return; }
+    if (piece[1] == '\0') {
+        unsigned char byte_val = piece[0];
+        if (!(isprint(byte_val) || isspace(byte_val))) {
+            return;
+        }
+    }
+    printf("%s", piece);
+}
+
+/* Linear search - slower but avoids qsort which is too slow with SDRAM strings */
+static int str_lookup_linear(char *str, char **vocab, int vocab_size) {
+    for (int i = 0; i < vocab_size; i++) {
+        if (strcmp(str, vocab[i]) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
+    (void)sorted_vocab;  /* Not used with linear search */
+    /* Use global tokenizer vocab for linear search */
+    extern Tokenizer* g_tokenizer;
+    return str_lookup_linear(str, g_tokenizer->vocab, vocab_size);
+}
+
+static void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
+    if (text == NULL) {
+        printf("ERROR: cannot encode NULL text\n");
+        while(1);
+    }
+
+    /* Skip qsort - use linear search instead (qsort too slow with SDRAM strings) */
+    (void)t->sorted_vocab;  /* Not used */
+
+    /* Use static BRAM buffer - SDRAM byte writes don't work! */
+    char* str_buffer = encode_str_buffer;
+    size_t str_len = 0;
+
+    *n_tokens = 0;
+
+    if (bos) tokens[(*n_tokens)++] = 1;
+
+    if (text[0] != '\0') {
+        int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocab_size);
+        if (dummy_prefix != -1) {
+            tokens[(*n_tokens)++] = dummy_prefix;
+        }
+        /* If space not found, skip the dummy prefix - some tokenizers don't have it */
+    }
+    for (char *c = text; *c != '\0'; c++) {
+        if ((*c & 0xC0) != 0x80) {
+            str_len = 0;
+        }
+
+        str_buffer[str_len++] = *c;
+        str_buffer[str_len] = '\0';
+
+        if ((*(c+1) & 0xC0) == 0x80 && str_len < 4) {
+            continue;
+        }
+
+        int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+
+        if (id != -1) {
+            tokens[(*n_tokens)++] = id;
+        } else {
+            for (size_t i = 0; i < str_len; i++) {
+                tokens[(*n_tokens)++] = (unsigned char)str_buffer[i] + 3;
+            }
+        }
+        str_len = 0;
+    }
+
+    /* BPE merge */
+    while (1) {
+        float best_score = -1e10;
+        int best_id = -1;
+        int best_idx = -1;
+
+        for (int i = 0; i < (*n_tokens-1); i++) {
+            sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i+1]]);
+            int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+            if (id != -1 && t->vocab_scores[id] > best_score) {
+                best_score = t->vocab_scores[id];
+                best_id = id;
+                best_idx = i;
+            }
+        }
+
+        if (best_idx == -1) {
+            break;
+        }
+
+        tokens[best_idx] = best_id;
+        for (int i = best_idx+1; i < (*n_tokens-1); i++) {
+            tokens[i] = tokens[i+1];
+        }
+        (*n_tokens)--;
+    }
+
+    if (eos) tokens[(*n_tokens)++] = 2;
+
+    /* str_buffer is static BRAM, no free needed */
+}
+
+/* ============================================
+ * Sampler
+ * ============================================ */
+
+static int sample_argmax(float* probabilities, int n) {
+    int max_i = 0;
+    float max_p = probabilities[0];
+
+    for (int i = 1; i < n; i++) {
+        if (probabilities[i] > max_p) {
+            max_i = i;
+            max_p = probabilities[i];
+        }
+    }
+    return max_i;
+}
+
+static int sample_mult(float* probabilities, int n, float coin) {
+    float cdf = 0.0f;
+    for (int i = 0; i < n; i++) {
+        cdf += probabilities[i];
+        if (coin < cdf) {
+            return i;
+        }
+    }
+    return n - 1;
+}
+
+static int compare_prob(const void* a, const void* b) {
+    ProbIndex* a_ = (ProbIndex*) a;
+    ProbIndex* b_ = (ProbIndex*) b;
+    if (a_->prob > b_->prob) return -1;
+    if (a_->prob < b_->prob) return 1;
+    return 0;
+}
+
+static int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, float coin) {
+    int n0 = 0;
+    const float cutoff = (1.0f - topp) / (n - 1);
+    for (int i = 0; i < n; i++) {
+        if (probabilities[i] >= cutoff) {
+            probindex[n0].index = i;
+            probindex[n0].prob = probabilities[i];
+            n0++;
+        }
+    }
+    qsort(probindex, n0, sizeof(ProbIndex), compare_prob);
+
+    float cumulative_prob = 0.0f;
+    int last_idx = n0 - 1;
+    for (int i = 0; i < n0; i++) {
+        cumulative_prob += probindex[i].prob;
+        if (cumulative_prob > topp) {
+            last_idx = i;
+            break;
+        }
+    }
+
+    float r = coin * cumulative_prob;
+    float cdf = 0.0f;
+    for (int i = 0; i <= last_idx; i++) {
+        cdf += probindex[i].prob;
+        if (r < cdf) {
+            return probindex[i].index;
+        }
+    }
+    return probindex[last_idx].index;
+}
+
+static void build_sampler(Sampler* sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
+    sampler->vocab_size = vocab_size;
+    sampler->temperature = temperature;
+    sampler->topp = topp;
+    sampler->rng_state = rng_seed;
+    sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
+}
+
+static void free_sampler(Sampler* sampler) {
+    free(sampler->probindex);
+}
+
+static unsigned int random_u32(unsigned long long *state) {
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    return (*state * 0x2545F4914F6CDD1Dull) >> 32;
+}
+
+static float random_f32(unsigned long long *state) {
+    return (random_u32(state) >> 8) / 16777216.0f;
+}
+
+static int sample(Sampler* sampler, float* logits) {
+    int next;
+    if (sampler->temperature == 0.0f) {
+        next = sample_argmax(logits, sampler->vocab_size);
+    } else {
+        for (int q = 0; q < sampler->vocab_size; q++) {
+            logits[q] /= sampler->temperature;
+        }
+        softmax(logits, sampler->vocab_size);
+        float coin = random_f32(&sampler->rng_state);
+        if (sampler->topp <= 0 || sampler->topp >= 1) {
+            next = sample_mult(logits, sampler->vocab_size, coin);
+        } else {
+            next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
+        }
+    }
+    return next;
+}
+
+/* ============================================
+ * Generation loop
+ * ============================================ */
+
+static void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
+    char *empty_prompt = "";
+    if (prompt == NULL) { prompt = empty_prompt; }
+
+    int num_prompt_tokens = 0;
+    int* prompt_tokens = (int*)malloc((strlen(prompt)+3) * sizeof(int));
+    if (!prompt_tokens) {
+        printf("ERROR: malloc failed\n");
+        while(1);
+    }
+    encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+
+    if (num_prompt_tokens < 1) {
+        printf("ERROR: expected at least 1 prompt token\n");
+        while(1);
+    }
+
+    long start = 0;
+    int next;
+    int token = prompt_tokens[0];
+    int pos = 0;
+
+    while (pos < steps) {
+        float* logits = forward(transformer, token, pos);
+
+        if (pos < num_prompt_tokens - 1) {
+            next = prompt_tokens[pos + 1];
+        } else {
+            next = sample(sampler, logits);
+        }
+        pos++;
+
+        if (next == 1) { break; }
+
+        char* piece = decode(tokenizer, token, next);
+        safe_printf(piece);
+        token = next;
+
+        if (start == 0) { start = time(NULL); }
+    }
+    printf("\n");
+
+    if (pos > 1) {
+        long end = time(NULL);
+        if (end > start) {
+            printf("Speed: %d tok/s\n", (int)((pos-1) / (end-start)));
+        }
+    }
+
+    free(prompt_tokens);
+}
+
+/* ============================================
+ * Main entry point
+ * ============================================ */
+
+/*
+ * Memory Layout:
+ *
+ * SDRAM (64MB): Model and tokenizer loaded by APF
+ * Bridge 0x00000000 -> CPU 0x10000000: Model weights (up to 63MB)
+ * Bridge 0x03F00000 -> CPU 0x13F00000: Tokenizer (last 1MB)
+ *
+ * PSRAM (CRAM0, 16MB): Heap for runtime allocations
+ * CPU 0x30000000 - 0x30FFFFFF
+ */
+#define MODEL_SDRAM_ADDR      0x10000000                  /* Slot 0: bridge 0x00000000 */
+#define TOKENIZER_SDRAM_ADDR  0x13F00000                  /* Slot 1: bridge 0x03F00000 */
+#define HEAP_PSRAM_ADDR       0x30000000                  /* Heap in PSRAM (CRAM0) */
+#define PSRAM_END             0x31000000                  /* End of 16MB PSRAM */
+#define HEAP_SIZE             (PSRAM_END - HEAP_PSRAM_ADDR)  /* 16MB for heap */
+
+void llama_main(void) {
+    printf("llama2.c for Analogue Pocket\n\n");
+
+    /* Wait for SDRAM and APF automatic data slot loading */
+    while (!(SYS_STATUS & SYS_STATUS_SDRAM_READY)) {}
+    printf("SDRAM ready, waiting for data...\n");
+
+    /* Wait for APF to finish auto-loading data slots */
+    while (!(SYS_STATUS & SYS_STATUS_DATASLOT_COMPLETE)) {}
+    printf("Data loaded\n");
+
+    /* Quick model sanity check */
+    volatile uint32_t *model_header = (volatile uint32_t *)MODEL_SDRAM_ADDR;
+    uint32_t dim = model_header[0];
+    if (dim == 0 || dim > 10000) {
+        printf("ERROR: Invalid model (dim=%d)\n", dim);
+        while(1);
+    }
+    printf("Model check OK (dim=%d)\n", dim);
+
+    /* Test PSRAM write/read from CPU */
+    volatile uint32_t *test_addr = (volatile uint32_t *)HEAP_PSRAM_ADDR;
+    *test_addr = 0xDEADBEEF;
+    if (*test_addr != 0xDEADBEEF) {
+        printf("ERROR: PSRAM write failed!\n");
+        while(1);
+    }
+    heap_init((void*)HEAP_PSRAM_ADDR, HEAP_SIZE);
+    printf("PSRAM heap OK\n");
+
+    /* Build transformer from loaded data */
+    Transformer transformer;
+    build_transformer_from_memory(&transformer, (void*)MODEL_SDRAM_ADDR, 0);
+    printf("Model: dim=%d layers=%d vocab=%d\n",
+           transformer.config.dim, transformer.config.n_layers, transformer.config.vocab_size);
+
+    /* Build tokenizer from SDRAM */
+    Tokenizer tokenizer;
+    build_tokenizer_from_memory(&tokenizer, (void*)TOKENIZER_SDRAM_ADDR, transformer.config.vocab_size);
+    g_tokenizer = &tokenizer;
+
+    /* Build sampler */
+    Sampler sampler;
+    build_sampler(&sampler, transformer.config.vocab_size, DEFAULT_TEMPERATURE, DEFAULT_TOPP, SYS_CYCLE_LO);
+
+    /* Run generation */
+    printf("\n--- Generating ---\n");
+    printf("Prompt: \"%s\"\n\n", DEFAULT_PROMPT);
+
+    generate(&transformer, &tokenizer, &sampler, (char*)DEFAULT_PROMPT, DEFAULT_STEPS);
+
+    /* Cleanup */
+    printf("\nCleaning up...\n");
+    free_sampler(&sampler);
+    free_tokenizer(&tokenizer);
+    free_transformer(&transformer);
+
+    printf("Done!\n");
+
+    /* Halt */
+    while(1);
+}
