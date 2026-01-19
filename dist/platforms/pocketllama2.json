@@ -1,7 +1,7 @@
 {
   "platform": {
-    "category": "Homebrew",
-    "name": "VexRiscv RISC-V Demo",
+    "category": "AI",
+    "name": "PocketLlama2",
     "year": 2026,
     "manufacturer": "ThinkElastic"
   }

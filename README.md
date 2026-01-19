@@ -17,7 +17,7 @@ A demonstration core featuring a VexRiscv RISC-V CPU running on the Analogue Poc
 
 1. Copy the `release/Cores` and `release/Platforms` folders to your Analogue Pocket SD card root
 2. Power on your Analogue Pocket
-3. Navigate to Cores menu and select "Homebrew"
+3. Navigate to Cores menu and select "PocketLlama2"
 4. The core will display output on screen
 
 ## Project Structure
@@ -45,7 +45,7 @@ A demonstration core featuring a VexRiscv RISC-V CPU running on the Analogue Poc
 │       └── Makefile              # Build system
 │
 ├── release/                      # Ready for SD card
-│   ├── Cores/ThinkElastic.Homebrew/
+│   ├── Cores/ThinkElastic.PocketLlama2/
 │   └── Platforms/
 │
 ├── dist/                         # Distribution assets
@@ -195,7 +195,7 @@ void term_printf(const char *fmt, ...); // Formatted output
 ### Packaging for Analogue Pocket
 
 After compilation, the release folder contains everything needed:
-- `release/Cores/ThinkElastic.Homebrew/` - Core files
+- `release/Cores/ThinkElastic.PocketLlama2/` - Core files
 - `release/Platforms/` - Platform definition
 
 Copy both folders to your SD card root.
